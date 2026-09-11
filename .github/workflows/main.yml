@@ -3,54 +3,250 @@ name: Datarhei Restreamer
 on:
   workflow_dispatch:
 
+  workflow_run:
+    workflows:
+      - "Datarhei Restreamer"
+    types:
+      - completed
+
+concurrency:
+  group: datarhei-restreamer
+  cancel-in-progress: false
+
 jobs:
   restreamer:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
+    permissions:
+      contents: read
+      actions: read
+      actions: write
+
     steps:
+
+      # ==========================================
+      # 1. Checkout
+      # ==========================================
 
       - name: Checkout
         uses: actions/checkout@v4
 
+
+      # ==========================================
+      # 2. Install required packages
+      # ==========================================
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            jq \
+            unzip
+
+
+      # ==========================================
+      # 3. Install Tailscale
+      # ==========================================
+
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+
+      # ==========================================
+      # 4. Create Tailscale Auth Key
+      #    using your API key
+      # ==========================================
+
+      - name: Create Tailscale Auth Key
+        env:
+          TS_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+
+          set -e
+
+          if [ -z "$TS_API_KEY" ]; then
+            echo "TAILSCALE_API_KEY is missing."
+            exit 1
+          fi
+
+          echo "Creating temporary Tailscale Auth Key..."
+
+          RESPONSE=$(curl -fsS \
+            -u "${TS_API_KEY}:" \
+            -X POST \
+            "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "capabilities": {
+                "devices": {
+                  "create": {
+                    "reusable": false,
+                    "ephemeral": false,
+                    "preauthorized": true
+                  }
+                }
+              },
+              "expirySeconds": 3600
+            }')
+
+          echo "$RESPONSE" > tailscale-response.json
+
+          AUTH_KEY=$(echo "$RESPONSE" | jq -r '.key')
+
+          if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
+            echo "Could not create Tailscale Auth Key."
+            cat tailscale-response.json
+            exit 1
+          fi
+
+          echo "TS_AUTH_KEY=$AUTH_KEY" >> "$GITHUB_ENV"
+
+          echo "Tailscale Auth Key created."
+
+
+      # ==========================================
+      # 5. Connect Tailscale
+      # ==========================================
 
       - name: Connect to Tailscale
         run: |
+
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --auth-key="$TS_AUTH_KEY" \
             --hostname="github-restreamer"
+
+          sleep 5
+
+
+      # ==========================================
+      # 6. Show Tailscale IP
+      # ==========================================
 
       - name: Show Tailscale IP
         run: |
-          echo "=============================="
-          echo "Tailscale IPv4"
-          echo "=============================="
+
+          echo "===================================="
+          echo "        TAILSCALE INFORMATION"
+          echo "===================================="
+
+          echo "IPv4:"
           tailscale ip -4
+
           echo
+          echo "Status:"
           tailscale status
-          echo "=============================="
 
-      - name: Check Docker
-        run: |
-          docker --version
+          echo "===================================="
 
-      - name: Create Restreamer folders
+
+      # ==========================================
+      # 7. Create Restreamer directories
+      # ==========================================
+
+      - name: Create Restreamer directories
         run: |
+
           mkdir -p "$GITHUB_WORKSPACE/restreamer/config"
           mkdir -p "$GITHUB_WORKSPACE/restreamer/data"
 
-      - name: Restore Restreamer data
-        uses: actions/download-artifact@v4
-        with:
-          name: restreamer-data
-          path: "$GITHUB_WORKSPACE/restreamer"
-        continue-on-error: true
+
+      # ==========================================
+      # 8. Restore previous Restreamer data
+      # ==========================================
+
+      - name: Restore previous Restreamer data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+
+          set +e
+
+          echo "Searching for previous Restreamer backup..."
+
+          ARTIFACT_ID=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '
+              .artifacts[]
+              | select(.name=="restreamer-data")
+              | select(.expired==false)
+              | [.id,.created_at]
+              | @tsv
+            ' 2>/dev/null \
+            | sort -k2 \
+            | tail -n 1 \
+            | cut -f1)
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No previous backup found."
+            exit 0
+          fi
+
+          echo "Found artifact ID: $ARTIFACT_ID"
+
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            > restreamer-backup.zip
+
+          if [ ! -s restreamer-backup.zip ]; then
+            echo "Backup is empty."
+            exit 0
+          fi
+
+          rm -rf restore-temp
+          mkdir -p restore-temp
+
+          unzip -o restreamer-backup.zip \
+            -d restore-temp
+
+          if [ -d "restore-temp/restreamer" ]; then
+            cp -a restore-temp/restreamer/. \
+              "$GITHUB_WORKSPACE/restreamer/"
+          else
+            cp -a restore-temp/. \
+              "$GITHUB_WORKSPACE/restreamer/" 2>/dev/null || true
+          fi
+
+          echo
+          echo "Restreamer data restored."
+
+          echo "Config:"
+          find "$GITHUB_WORKSPACE/restreamer/config" \
+            -maxdepth 2 \
+            -type f 2>/dev/null || true
+
+          echo
+          echo "Data:"
+          find "$GITHUB_WORKSPACE/restreamer/data" \
+            -maxdepth 2 \
+            -type f 2>/dev/null || true
+
+
+      # ==========================================
+      # 9. Check Docker
+      # ==========================================
+
+      - name: Check Docker
+        run: |
+
+          docker --version
+          docker info
+
+
+      # ==========================================
+      # 10. Start Datarhei Restreamer
+      # ==========================================
 
       - name: Start Datarhei Restreamer
         run: |
+
           docker rm -f restreamer 2>/dev/null || true
 
           docker run -d \
@@ -65,33 +261,87 @@ jobs:
             -p 6000:6000/udp \
             datarhei/restreamer:latest
 
-      - name: Show Restreamer
+          echo "Restreamer started."
+
+
+      # ==========================================
+      # 11. Show information
+      # ==========================================
+
+      - name: Show Restreamer information
         run: |
-          sleep 10
 
-          echo "=============================="
-          echo "Tailscale IP:"
-          tailscale ip -4
-          echo "=============================="
+          sleep 15
 
-          echo "Restreamer:"
+          echo "===================================="
+          echo "          RESTREAMER"
+          echo "===================================="
+
           docker ps
 
-          echo "=============================="
-          echo "Restreamer Logs:"
-          echo "=============================="
+          echo
+          echo "===================================="
+          echo "       TAILSCALE IPv4"
+          echo "===================================="
 
-          docker logs --tail 50 restreamer
+          tailscale ip -4
 
-      - name: Keep Runner alive
+          echo
+          echo "===================================="
+          echo "       RESTREAMER LOGS"
+          echo "===================================="
+
+          docker logs --tail 100 restreamer || true
+
+
+      # ==========================================
+      # 12. Keep it running
+      # ==========================================
+
+      - name: Keep Restreamer running
         run: |
-          echo "Restreamer is running..."
-          sleep 20800
+
+          echo "===================================="
+          echo "Restreamer is running."
+          echo "The runner will stay alive."
+          echo "===================================="
+
+          END=$((SECONDS + 20400))
+
+          while [ $SECONDS -lt $END ]; do
+
+            if ! docker ps \
+              --format '{{.Names}}' \
+              | grep -q '^restreamer$'; then
+
+              echo "Restreamer stopped unexpectedly."
+
+              docker logs restreamer || true
+
+              exit 1
+            fi
+
+            sleep 30
+
+          done
+
+          echo "6-hour cycle finished."
+
+
+      # ==========================================
+      # 13. Stop Restreamer
+      # ==========================================
 
       - name: Stop Restreamer
         if: always()
         run: |
-          docker stop restreamer || true
+
+          docker stop restreamer 2>/dev/null || true
+
+
+      # ==========================================
+      # 14. Save Restreamer data
+      # ==========================================
 
       - name: Save Restreamer data
         if: always()
