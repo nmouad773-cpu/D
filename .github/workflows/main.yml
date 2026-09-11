@@ -1,0 +1,78 @@
+name: Datarhei Restreamer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restreamer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+
+      - name: Show Tailscale IP
+        run: |
+          echo "=============================="
+          echo "TAILSCALE IP"
+          echo "=============================="
+          tailscale ip -4
+          echo "=============================="
+          tailscale status
+
+      - name: Install Docker
+        run: |
+          docker --version
+
+      - name: Create Restreamer folders
+        run: |
+          mkdir -p restreamer/config
+          mkdir -p restreamer/data
+
+      - name: Start Datarhei Restreamer
+        run: |
+          docker rm -f restreamer 2>/dev/null || true
+
+          docker run -d \
+            --name restreamer \
+            -v "$PWD/restreamer/config:/core/config" \
+            -v "$PWD/restreamer/data:/core/data" \
+            -p 8080:8080 \
+            -p 8181:8181 \
+            -p 1935:1935 \
+            -p 1936:1936 \
+            -p 6000:6000/udp \
+            datarhei/restreamer:latest
+
+      - name: Show Restreamer information
+        run: |
+          sleep 10
+
+          echo "=============================="
+          echo "Tailscale IP:"
+          tailscale ip -4
+          echo "=============================="
+
+          echo "Restreamer:"
+          docker ps
+
+      - name: Keep Runner alive
+        run: |
+          sleep 20800
+
+      - name: Save Restreamer data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restreamer-data
+          path: restreamer/
+          retention-days: 7
+          overwrite: true
