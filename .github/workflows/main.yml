@@ -13,29 +13,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          version: latest
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="github-restreamer"
 
       - name: Show Tailscale IP
         run: |
           echo "=============================="
-          echo "TAILSCALE IP"
+          echo "Tailscale IPv4"
           echo "=============================="
           tailscale ip -4
-          echo "=============================="
+          echo
           tailscale status
+          echo "=============================="
 
-      - name: Install Docker
+      - name: Check Docker
         run: |
           docker --version
 
       - name: Create Restreamer folders
         run: |
-          mkdir -p restreamer/config
-          mkdir -p restreamer/data
+          mkdir -p "$GITHUB_WORKSPACE/restreamer/config"
+          mkdir -p "$GITHUB_WORKSPACE/restreamer/data"
+
+      - name: Restore Restreamer data
+        uses: actions/download-artifact@v4
+        with:
+          name: restreamer-data
+          path: "$GITHUB_WORKSPACE/restreamer"
+        continue-on-error: true
 
       - name: Start Datarhei Restreamer
         run: |
@@ -43,8 +55,9 @@ jobs:
 
           docker run -d \
             --name restreamer \
-            -v "$PWD/restreamer/config:/core/config" \
-            -v "$PWD/restreamer/data:/core/data" \
+            --restart unless-stopped \
+            -v "$GITHUB_WORKSPACE/restreamer/config:/core/config" \
+            -v "$GITHUB_WORKSPACE/restreamer/data:/core/data" \
             -p 8080:8080 \
             -p 8181:8181 \
             -p 1935:1935 \
@@ -52,7 +65,7 @@ jobs:
             -p 6000:6000/udp \
             datarhei/restreamer:latest
 
-      - name: Show Restreamer information
+      - name: Show Restreamer
         run: |
           sleep 10
 
@@ -64,9 +77,21 @@ jobs:
           echo "Restreamer:"
           docker ps
 
+          echo "=============================="
+          echo "Restreamer Logs:"
+          echo "=============================="
+
+          docker logs --tail 50 restreamer
+
       - name: Keep Runner alive
         run: |
+          echo "Restreamer is running..."
           sleep 20800
+
+      - name: Stop Restreamer
+        if: always()
+        run: |
+          docker stop restreamer || true
 
       - name: Save Restreamer data
         if: always()
