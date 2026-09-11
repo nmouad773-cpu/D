@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
   actions: write
 
 concurrency:
@@ -83,10 +82,14 @@ jobs:
 
       - name: Show Tailscale IP
         run: |
-          echo "=============================="
-          echo "Tailscale IPv4:"
+          echo "================================"
+          echo "Tailscale IPv4"
+          echo "================================"
+
           tailscale ip -4
-          echo "=============================="
+
+          echo
+          echo "Tailscale status:"
           tailscale status
 
       - name: Create Restreamer folders
@@ -98,9 +101,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
+          set -e
 
-          echo "Searching for previous backup..."
+          echo "Searching for previous Restreamer backup..."
 
           ARTIFACT_ID=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
@@ -110,36 +113,35 @@ jobs:
               | select(.expired==false)
               | [.id,.created_at]
               | @tsv
-            ' 2>/dev/null \
+            ' \
             | sort -k2 \
             | tail -n 1 \
             | cut -f1)
 
           if [ -z "$ARTIFACT_ID" ]; then
             echo "No previous backup found."
-            exit 0
-          fi
-
-          echo "Found backup: $ARTIFACT_ID"
-
-          gh api \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
-            > restreamer-backup.zip
-
-          mkdir -p restore-temp
-
-          unzip -o restreamer-backup.zip \
-            -d restore-temp
-
-          if [ -d "restore-temp/restreamer" ]; then
-            cp -a restore-temp/restreamer/. \
-              "$GITHUB_WORKSPACE/restreamer/"
           else
-            cp -a restore-temp/. \
-              "$GITHUB_WORKSPACE/restreamer/" 2>/dev/null || true
-          fi
+            echo "Found backup artifact: $ARTIFACT_ID"
 
-          echo "Restreamer data restored."
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+              > restreamer-backup.zip
+
+            mkdir -p restore-temp
+
+            unzip -o restreamer-backup.zip \
+              -d restore-temp
+
+            if [ -d "restore-temp/restreamer" ]; then
+              cp -a restore-temp/restreamer/. \
+                "$GITHUB_WORKSPACE/restreamer/"
+            else
+              cp -a restore-temp/. \
+                "$GITHUB_WORKSPACE/restreamer/" || true
+            fi
+
+            echo "Restreamer data restored."
+          fi
 
       - name: Check Docker
         run: |
@@ -162,23 +164,23 @@ jobs:
             -p 6000:6000/udp \
             datarhei/restreamer:latest
 
-          echo "Restreamer started."
+          echo "Datarhei Restreamer started."
 
       - name: Show Restreamer information
         run: |
           sleep 15
 
-          echo "=============================="
+          echo "================================"
           echo "Tailscale IP:"
           tailscale ip -4
-          echo "=============================="
+          echo "================================"
 
           echo "Restreamer:"
           docker ps
 
-          echo "=============================="
-          echo "Restreamer Logs:"
-          echo "=============================="
+          echo "================================"
+          echo "Restreamer logs:"
+          echo "================================"
 
           docker logs --tail 100 restreamer || true
 
@@ -194,16 +196,17 @@ jobs:
               --format '{{.Names}}' \
               | grep -q '^restreamer$'; then
 
-              echo "Restreamer stopped."
+              echo "Restreamer stopped unexpectedly."
+
               docker logs restreamer || true
+
               exit 1
             fi
 
             sleep 30
-
           done
 
-          echo "6-hour cycle finished."
+          echo "Cycle finished."
 
       - name: Stop Restreamer
         if: always()
