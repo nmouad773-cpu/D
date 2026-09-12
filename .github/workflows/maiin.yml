@@ -90,21 +90,13 @@ jobs:
           echo "Tailscale IPv4"
           echo "================================"
 
-          tailscale ip -4
+          TS_IP=$(tailscale ip -4)
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "$TS_IP"
 
           echo
           echo "Tailscale status:"
           tailscale status
-
-      # ==============================
-      # OME DIRECTORIES
-      # ==============================
-
-      - name: Create OvenMediaEngine folders
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/config"
-          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/logs"
-          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/record"
 
       # ==============================
       # RESTORE BACKUP
@@ -145,54 +137,27 @@ jobs:
             unzip -o ovenmediaengine-backup.zip \
               -d restore-temp
 
-            if [ -d "restore-temp/ovenmediaengine" ]; then
-              cp -a restore-temp/ovenmediaengine/. \
-                "$GITHUB_WORKSPACE/ovenmediaengine/"
-            else
-              cp -a restore-temp/. \
-                "$GITHUB_WORKSPACE/ovenmediaengine/" || true
+            if [ -d "restore-temp/ome_launcher" ]; then
+              cp -a restore-temp/ome_launcher/. "$GITHUB_WORKSPACE/" || true
             fi
 
             echo "OME data restored."
           fi
 
       # ==============================
-      # DOCKER
+      # OME LAUNCHER SETUP & START
       # ==============================
 
-      - name: Check Docker
+      - name: Download & Setup OME Docker Launcher
         run: |
-          docker --version
-          docker info
-
-      - name: Pull OvenMediaEngine
-        run: |
-          docker pull airensoft/ovenmediaengine:latest
-
-      # ==============================
-      # START OME
-      # ==============================
+          curl -OL 'https://raw.githubusercontent.com/AirenSoft/OvenMediaEngine/master/misc/ome_docker_launcher.sh'
+          chmod +x ome_docker_launcher.sh
+          sudo ./ome_docker_launcher.sh setup
 
       - name: Start OvenMediaEngine
         run: |
-          docker rm -f ovenmediaengine 2>/dev/null || true
-
-          docker run -d \
-            --name ovenmediaengine \
-            --restart unless-stopped \
-            -v "$GITHUB_WORKSPACE/ovenmediaengine/config:/opt/ovenmediaengine/bin/origin_conf" \
-            -v "$GITHUB_WORKSPACE/ovenmediaengine/logs:/opt/ovenmediaengine/logs" \
-            -v "$GITHUB_WORKSPACE/ovenmediaengine/record:/opt/ovenmediaengine/record" \
-            -p 1935:1935/tcp \
-            -p 3333:3333/tcp \
-            -p 3334:3334/tcp \
-            -p 8080:8080/tcp \
-            -p 8081:8081/tcp \
-            -p 8443:8443/tcp \
-            -p 10000-10009:10000-10009/udp \
-            airensoft/ovenmediaengine:latest
-
-          echo "OvenMediaEngine started."
+          echo "Starting OvenMediaEngine with Host IP: $TS_IP"
+          sudo OME_HOST_IP="$TS_IP" ./ome_docker_launcher.sh start
 
       # ==============================
       # INFORMATION
@@ -206,11 +171,11 @@ jobs:
           echo "Tailscale IP"
           echo "================================"
 
-          tailscale ip -4
+          echo "$TS_IP"
 
           echo
           echo "================================"
-          echo "Docker"
+          echo "Docker Containers"
           echo "================================"
 
           docker ps
@@ -230,14 +195,9 @@ jobs:
         run: |
           sleep 5
 
-          if ! docker ps \
-            --format '{{.Names}}' \
-            | grep -q '^ovenmediaengine$'; then
-
+          if ! docker ps --format '{{.Names}}' | grep -q 'ovenmediaengine'; then
             echo "OvenMediaEngine failed to start."
-
             docker logs ovenmediaengine || true
-
             exit 1
           fi
 
@@ -255,19 +215,13 @@ jobs:
 
           while [ $SECONDS -lt $END ]; do
 
-            if ! docker ps \
-              --format '{{.Names}}' \
-              | grep -q '^ovenmediaengine$'; then
-
+            if ! docker ps --format '{{.Names}}' | grep -q 'ovenmediaengine'; then
               echo "OvenMediaEngine stopped unexpectedly."
-
               docker logs ovenmediaengine || true
-
               exit 1
             fi
 
             echo "OME is still running..."
-
             sleep 30
 
           done
@@ -281,7 +235,7 @@ jobs:
       - name: Stop OvenMediaEngine
         if: always()
         run: |
-          docker stop ovenmediaengine 2>/dev/null || true
+          sudo ./ome_docker_launcher.sh stop 2>/dev/null || docker stop ovenmediaengine 2>/dev/null || true
 
       # ==============================
       # BACKUP
@@ -292,6 +246,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ovenmediaengine-data
-          path: ovenmediaengine/
+          path: |
+            conf/
+            logs/
           retention-days: 7
           overwrite: true
