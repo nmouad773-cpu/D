@@ -1,0 +1,297 @@
+name: OvenMediaEngine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ovenmediaengine
+  cancel-in-progress: false
+
+jobs:
+  ovenmediaengine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip
+
+      # ==============================
+      # TAILSCALE
+      # ==============================
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale version
+
+      - name: Create Tailscale Auth Key
+        env:
+          TS_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          set -e
+
+          if [ -z "$TS_API_KEY" ]; then
+            echo "TAILSCALE_API_KEY is missing."
+            exit 1
+          fi
+
+          echo "Creating Tailscale Auth Key..."
+
+          RESPONSE=$(curl -fsS \
+            -u "${TS_API_KEY}:" \
+            -X POST \
+            "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "capabilities": {
+                "devices": {
+                  "create": {
+                    "reusable": false,
+                    "ephemeral": false,
+                    "preauthorized": true
+                  }
+                }
+              },
+              "expirySeconds": 3600
+            }')
+
+          AUTH_KEY=$(echo "$RESPONSE" | jq -r '.key')
+
+          if [ -z "$AUTH_KEY" ] || [ "$AUTH_KEY" = "null" ]; then
+            echo "Failed to create Tailscale Auth Key."
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "TS_AUTH_KEY=$AUTH_KEY" >> "$GITHUB_ENV"
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up \
+            --auth-key="$TS_AUTH_KEY" \
+            --hostname="github-ovenmediaengine"
+
+          sleep 5
+
+      - name: Show Tailscale IP
+        run: |
+          echo "================================"
+          echo "Tailscale IPv4"
+          echo "================================"
+
+          tailscale ip -4
+
+          echo
+          echo "Tailscale status:"
+          tailscale status
+
+      # ==============================
+      # OME DIRECTORIES
+      # ==============================
+
+      - name: Create OvenMediaEngine folders
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/config"
+          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/logs"
+          mkdir -p "$GITHUB_WORKSPACE/ovenmediaengine/record"
+
+      # ==============================
+      # RESTORE BACKUP
+      # ==============================
+
+      - name: Restore previous OME data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+
+          echo "Searching for previous OME backup..."
+
+          ARTIFACT_ID=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '
+              .artifacts[]
+              | select(.name=="ovenmediaengine-data")
+              | select(.expired==false)
+              | [.id,.created_at]
+              | @tsv
+            ' \
+            | sort -k2 \
+            | tail -n 1 \
+            | cut -f1)
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No previous OME backup found."
+          else
+            echo "Found backup artifact: $ARTIFACT_ID"
+
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+              > ovenmediaengine-backup.zip
+
+            mkdir -p restore-temp
+
+            unzip -o ovenmediaengine-backup.zip \
+              -d restore-temp
+
+            if [ -d "restore-temp/ovenmediaengine" ]; then
+              cp -a restore-temp/ovenmediaengine/. \
+                "$GITHUB_WORKSPACE/ovenmediaengine/"
+            else
+              cp -a restore-temp/. \
+                "$GITHUB_WORKSPACE/ovenmediaengine/" || true
+            fi
+
+            echo "OME data restored."
+          fi
+
+      # ==============================
+      # DOCKER
+      # ==============================
+
+      - name: Check Docker
+        run: |
+          docker --version
+          docker info
+
+      - name: Pull OvenMediaEngine
+        run: |
+          docker pull airensoft/ovenmediaengine:latest
+
+      # ==============================
+      # START OME
+      # ==============================
+
+      - name: Start OvenMediaEngine
+        run: |
+          docker rm -f ovenmediaengine 2>/dev/null || true
+
+          docker run -d \
+            --name ovenmediaengine \
+            --restart unless-stopped \
+            -v "$GITHUB_WORKSPACE/ovenmediaengine/config:/opt/ovenmediaengine/bin/origin_conf" \
+            -v "$GITHUB_WORKSPACE/ovenmediaengine/logs:/opt/ovenmediaengine/logs" \
+            -v "$GITHUB_WORKSPACE/ovenmediaengine/record:/opt/ovenmediaengine/record" \
+            -p 1935:1935/tcp \
+            -p 3333:3333/tcp \
+            -p 3334:3334/tcp \
+            -p 8080:8080/tcp \
+            -p 8081:8081/tcp \
+            -p 8443:8443/tcp \
+            -p 10000-10009:10000-10009/udp \
+            airensoft/ovenmediaengine:latest
+
+          echo "OvenMediaEngine started."
+
+      # ==============================
+      # INFORMATION
+      # ==============================
+
+      - name: Show OvenMediaEngine information
+        run: |
+          sleep 15
+
+          echo "================================"
+          echo "Tailscale IP"
+          echo "================================"
+
+          tailscale ip -4
+
+          echo
+          echo "================================"
+          echo "Docker"
+          echo "================================"
+
+          docker ps
+
+          echo
+          echo "================================"
+          echo "OME LOGS"
+          echo "================================"
+
+          docker logs --tail 150 ovenmediaengine || true
+
+      # ==============================
+      # HEALTH CHECK
+      # ==============================
+
+      - name: Check OvenMediaEngine
+        run: |
+          sleep 5
+
+          if ! docker ps \
+            --format '{{.Names}}' \
+            | grep -q '^ovenmediaengine$'; then
+
+            echo "OvenMediaEngine failed to start."
+
+            docker logs ovenmediaengine || true
+
+            exit 1
+          fi
+
+          echo "OvenMediaEngine is running correctly."
+
+      # ==============================
+      # KEEP ALIVE
+      # ==============================
+
+      - name: Keep OvenMediaEngine running
+        run: |
+          echo "OvenMediaEngine is running."
+
+          END=$((SECONDS + 20400))
+
+          while [ $SECONDS -lt $END ]; do
+
+            if ! docker ps \
+              --format '{{.Names}}' \
+              | grep -q '^ovenmediaengine$'; then
+
+              echo "OvenMediaEngine stopped unexpectedly."
+
+              docker logs ovenmediaengine || true
+
+              exit 1
+            fi
+
+            echo "OME is still running..."
+
+            sleep 30
+
+          done
+
+          echo "Cycle finished."
+
+      # ==============================
+      # STOP
+      # ==============================
+
+      - name: Stop OvenMediaEngine
+        if: always()
+        run: |
+          docker stop ovenmediaengine 2>/dev/null || true
+
+      # ==============================
+      # BACKUP
+      # ==============================
+
+      - name: Save OvenMediaEngine data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovenmediaengine-data
+          path: ovenmediaengine/
+          retention-days: 7
+          overwrite: true
